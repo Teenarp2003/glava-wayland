@@ -1,0 +1,14 @@
+[Unit]
+Description=GLava desktop audio bars on connected KDE displays
+After=plasma-workspace.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/glava-wayland/contrib/kde/glava-desktop.py --source %h/.local/share/glava-wayland --config %h/.config/glava-desktop
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+
+[Install]
+WantedBy=plasma-workspace.target
