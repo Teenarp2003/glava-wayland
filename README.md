@@ -4,6 +4,10 @@ This is a fork of the original repo which adds native support for Wayland, with 
 
 **Wayland / Hyprland:** an experimental native Wayland backend (EGL + `wlr-layer-shell`) renders GLava as a click-through desktop-background layer on wlroots-based compositors such as Hyprland. Build with `-Denable_wayland=true`. 
 
+## KDE Plasma / multiple displays
+
+This fork adds exact native Wayland output selection with `GLAVA_OUTPUT`, output-removal handling, and an optional KDE monitor supervisor. It keeps click-through bars above the wallpaper and below applications, and starts/stops one renderer per connected output. See [KDE setup and tests](contrib/kde/README.md).
+
 ## 1. Prerequisites
 You need a Linux machine running a wlroots-based compositor (this guide
 targets Hyprland).

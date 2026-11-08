@@ -2,8 +2,8 @@
 /* Native Wayland window creation and EGL context backend.
 
    Renders GLava as a wlr-layer-shell surface (desktop background by default),
-   suitable for wlroots-based compositors such as Hyprland, Sway, river and
-   Wayfire. The OpenGL renderer and shaders are shared with the other backends;
+   suitable for compositors exposing wlr-layer-shell, including KDE Plasma,
+   Hyprland, Sway, river and Wayfire. The OpenGL renderer and shaders are shared with the other backends;
    only window/context creation differs.
 
    Unlike the X11/GLX backend this file intentionally does NOT define
@@ -18,6 +18,7 @@
 #include <string.h>
 #include <errno.h>
 #include <time.h>
+#include <poll.h>
 
 #include <wayland-client.h>
 #include <wayland-egl.h>
@@ -37,6 +38,19 @@ static struct wl_registry*          registry     = NULL;
 static struct wl_compositor*        compositor   = NULL;
 static struct zwlr_layer_shell_v1*  layer_shell  = NULL;
 static struct wl_output*            output       = NULL;
+
+/* One renderer is pinned to one named output. A supervisor may launch one
+   process per monitor without relying on registry announcement ordering. */
+struct output_info {
+    struct wl_output* proxy;
+    uint32_t registry_name;
+    char* name;
+    bool removed;
+    struct output_info* next;
+};
+static struct output_info* outputs = NULL;
+static struct output_info* selected_output = NULL;
+static bool selected_output_removed = false;
 
 static EGLDisplay egl_display = EGL_NO_DISPLAY;
 
@@ -65,6 +79,45 @@ static bool offscreen(void) { return false; }
 
 /* --- registry --------------------------------------------------------- */
 
+static void output_geometry(void* data, struct wl_output* proxy,
+                            int32_t x, int32_t y, int32_t physical_width,
+                            int32_t physical_height, int32_t subpixel,
+                            const char* make, const char* model, int32_t transform) {
+    (void) data; (void) proxy; (void) x; (void) y;
+    (void) physical_width; (void) physical_height; (void) subpixel;
+    (void) make; (void) model; (void) transform;
+}
+static void output_mode(void* data, struct wl_output* proxy, uint32_t flags,
+                        int32_t width, int32_t height, int32_t refresh) {
+    (void) data; (void) proxy; (void) flags;
+    (void) width; (void) height; (void) refresh;
+}
+static void output_done(void* data, struct wl_output* proxy) {
+    (void) data; (void) proxy;
+}
+static void output_scale(void* data, struct wl_output* proxy, int32_t factor) {
+    (void) data; (void) proxy; (void) factor;
+}
+static void output_name(void* data, struct wl_output* proxy, const char* name) {
+    (void) proxy;
+    struct output_info* info = data;
+    free(info->name);
+    info->name = strdup(name);
+    if (!info->name) glava_abort();
+}
+static void output_description(void* data, struct wl_output* proxy,
+                               const char* description) {
+    (void) data; (void) proxy; (void) description;
+}
+static const struct wl_output_listener output_listener = {
+    .geometry = output_geometry,
+    .mode = output_mode,
+    .done = output_done,
+    .scale = output_scale,
+    .name = output_name,
+    .description = output_description
+};
+
 static void registry_global(void* data, struct wl_registry* reg, uint32_t name,
                             const char* interface, uint32_t version) {
     (void) data;
@@ -75,16 +128,34 @@ static void registry_global(void* data, struct wl_registry* reg, uint32_t name,
         layer_shell = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface,
                                        version < 4 ? version : 4);
     } else if (!strcmp(interface, wl_output_interface.name)) {
-        /* Bind the first advertised output; the compositor decides placement
-           when NULL is passed, but binding one keeps multi-monitor sane. */
-        if (!output)
-            output = wl_registry_bind(reg, name, &wl_output_interface,
-                                      version < 3 ? version : 3);
+        struct output_info* info = calloc(1, sizeof(*info));
+        if (!info) glava_abort();
+        info->registry_name = name;
+        info->proxy = wl_registry_bind(reg, name, &wl_output_interface,
+                                      version < 4 ? version : 4);
+        if (!info->proxy || wl_output_add_listener(info->proxy, &output_listener, info) < 0)
+            glava_abort();
+        /* Preserve announcement order for the no-GLAVA_OUTPUT default. */
+        struct output_info** tail = &outputs;
+        while (*tail) tail = &(*tail)->next;
+        *tail = info;
     }
 }
 
 static void registry_global_remove(void* data, struct wl_registry* reg, uint32_t name) {
-    (void) data; (void) reg; (void) name;
+    (void) data; (void) reg;
+    for (struct output_info* info = outputs; info; info = info->next) {
+        if (info->registry_name != name || info->removed) continue;
+        info->removed = true;
+        if (info == selected_output) {
+            selected_output_removed = true;
+            fprintf(stderr, "Wayland output '%s' disconnected; closing renderer.\n",
+                    info->name ? info->name : "unnamed");
+        }
+        /* Keep listener data alive until termination. Pending events on the
+           removed proxy must not dereference freed output_info memory. */
+        break;
+    }
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -134,8 +205,33 @@ static void init(void) {
     registry = wl_display_get_registry(display);
     wl_registry_add_listener(registry, &registry_listener, NULL);
     /* Two roundtrips: first to receive globals, second to settle output info. */
-    wl_display_roundtrip(display);
-    wl_display_roundtrip(display);
+    if (wl_display_roundtrip(display) < 0 || wl_display_roundtrip(display) < 0) {
+        fprintf(stderr, "Wayland registry discovery failed.\n");
+        glava_abort();
+    }
+
+    const char* requested_output = getenv("GLAVA_OUTPUT");
+    if (requested_output && !*requested_output) requested_output = NULL;
+    for (struct output_info* info = outputs; info; info = info->next) {
+        if (info->removed) continue;
+        if (!requested_output || (info->name && !strcmp(info->name, requested_output))) {
+            selected_output = info;
+            output = info->proxy;
+            break;
+        }
+    }
+    if (!selected_output) {
+        fprintf(stderr, "Wayland output '%s' is unavailable; refusing fallback.\n",
+                requested_output ? requested_output : "(any)");
+        fprintf(stderr, "Available named outputs:");
+        for (struct output_info* info = outputs; info; info = info->next)
+            if (!info->removed && info->name) fprintf(stderr, " %s", info->name);
+        fprintf(stderr, "\nNamed selection requires wl_output version 4.\n");
+        glava_abort();
+    }
+    selected_output_removed = false;
+    fprintf(stderr, "Using Wayland output: %s\n",
+            selected_output->name ? selected_output->name : "(first unnamed output)");
 
     if (!compositor) {
         fprintf(stderr, "Wayland compositor does not expose wl_compositor\n");
@@ -144,8 +240,8 @@ static void init(void) {
     if (!layer_shell) {
         fprintf(stderr,
                 "Wayland compositor does not support the wlr-layer-shell protocol\n"
-                "(zwlr_layer_shell_v1). This backend requires a wlroots-based\n"
-                "compositor such as Hyprland, Sway, river or Wayfire.\n");
+                "(zwlr_layer_shell_v1). Use a compositor exposing layer-shell,\n"
+                "such as KDE Plasma, Hyprland, Sway, river or Wayfire.\n");
         glava_abort();
     }
 
@@ -300,7 +396,16 @@ static void* create_and_bind(const char* name, const char* class,
 
     /* Initial commit without a buffer; wait for the first configure. */
     wl_surface_commit(w->surface);
-    wl_display_roundtrip(display);
+    while (!w->configured && !w->should_close && !selected_output_removed) {
+        if (wl_display_roundtrip(display) < 0) {
+            fprintf(stderr, "Wayland initial surface configuration failed.\n");
+            glava_abort();
+        }
+    }
+    if (w->should_close || selected_output_removed) {
+        fprintf(stderr, "Wayland output closed before surface configuration.\n");
+        glava_abort();
+    }
 
     int win_w = w->width  > 0 ? w->width  : 1;
     int win_h = w->height > 0 ? w->height : 1;
@@ -337,17 +442,57 @@ static void* create_and_bind(const char* name, const char* class,
 
 /* --- runtime hooks ---------------------------------------------------- */
 
-static void swap_buffers(struct wlwin* w) {
-    eglSwapBuffers(egl_display, w->egl_surface);
-    /* Pump any pending events (configure/closed) without blocking. */
-    wl_display_dispatch_pending(display);
-    wl_display_flush(display);
-    if (wl_display_get_error(display) != 0)
+/* Read events from the socket as well as dispatching queued events. EGL uses
+   its own queue; dispatch_pending alone can miss output removals indefinitely.
+   Never hold a prepared read across eglSwapBuffers, and never block here. */
+static void pump_events(struct wlwin* w) {
+    if (w->should_close) return;
+    while (wl_display_prepare_read(display) != 0) {
+        if (wl_display_dispatch_pending(display) < 0) {
+            w->should_close = true;
+            return;
+        }
+    }
+    if (wl_display_flush(display) < 0 && errno != EAGAIN) {
+        wl_display_cancel_read(display);
+        w->should_close = true;
+        return;
+    }
+    struct pollfd fd = { .fd = wl_display_get_fd(display), .events = POLLIN };
+    int ready = poll(&fd, 1, 0);
+    int poll_error = errno;
+    if (ready < 0 || (fd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+        wl_display_cancel_read(display);
+        if (ready >= 0 || poll_error != EINTR) w->should_close = true;
+    } else if (ready > 0 && (fd.revents & POLLIN)) {
+        if (wl_display_read_events(display) < 0) w->should_close = true;
+    } else {
+        wl_display_cancel_read(display);
+    }
+    if (wl_display_dispatch_pending(display) < 0 ||
+        wl_display_get_error(display) != 0 || selected_output_removed)
         w->should_close = true;
 }
 
-static bool should_close (struct wlwin* w) { return w->should_close; }
-static bool should_render(struct wlwin* w) { return !w->should_close; }
+static void swap_buffers(struct wlwin* w) {
+    pump_events(w);
+    if (w->should_close) return;
+    if (!eglSwapBuffers(egl_display, w->egl_surface)) {
+        fprintf(stderr, "eglSwapBuffers failed (0x%x); closing renderer.\n", eglGetError());
+        w->should_close = true;
+        return;
+    }
+    pump_events(w);
+}
+
+static bool should_close(struct wlwin* w) {
+    pump_events(w);
+    return w->should_close;
+}
+static bool should_render(struct wlwin* w) {
+    pump_events(w);
+    return !w->should_close;
+}
 static bool bg_changed   (struct wlwin* w) { (void) w; return false; }
 
 static void get_fbsize(struct wlwin* w, int* d, int* h) {
@@ -425,6 +570,20 @@ static void terminate(void) {
         eglTerminate(egl_display);
         egl_display = EGL_NO_DISPLAY;
     }
+    while (outputs) {
+        struct output_info* info = outputs;
+        outputs = info->next;
+        /* A local proxy destroy is valid even after global_remove/disconnect. */
+        wl_output_destroy(info->proxy);
+        free(info->name);
+        free(info);
+    }
+    output = NULL;
+    selected_output = NULL;
+    selected_output_removed = false;
+    if (layer_shell) { zwlr_layer_shell_v1_destroy(layer_shell); layer_shell = NULL; }
+    if (compositor) { wl_compositor_destroy(compositor); compositor = NULL; }
+    if (registry) { wl_registry_destroy(registry); registry = NULL; }
     if (display) {
         wl_display_disconnect(display);
         display = NULL;
