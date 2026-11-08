@@ -3,7 +3,55 @@
 import argparse,json,math,os,pathlib,re,shutil,signal,subprocess,time
 P=pathlib.Path
 
-def output_geometry(data, settings):
+# Plasma screen indexes need not equal KScreen output indexes, especially after
+# hotplug. Query each panel's actual logical screen rectangle instead.
+PANEL_SCRIPT = '''var ps=panels();var result=[];for(var i=0;i<ps.length;i++){var p=ps[i];result.push({id:p.id,screen:p.screen,height:p.height,location:p.location,floating:p.floating,hiding:p.hiding,geometry:screenGeometry(p.screen)});}print(JSON.stringify(result));'''
+
+def query_panels():
+    result=subprocess.run(['qdbus6','org.kde.plasmashell','/PlasmaShell',
+        'org.kde.PlasmaShell.evaluateScript',PANEL_SCRIPT],
+        capture_output=True,text=True,timeout=2,check=True)
+    panels=json.loads(result.stdout)
+    if not isinstance(panels,list):raise ValueError('Plasma panel query was not an array')
+    return panels
+
+class PanelTracker:
+    """Keep the last valid snapshot during a Plasma reload or D-Bus timeout."""
+    def __init__(self):self.panels=None;self.unavailable=False
+    def refresh(self):
+        try:
+            panels=query_panels()
+        except (OSError,subprocess.SubprocessError,json.JSONDecodeError,ValueError) as error:
+            if not self.unavailable:
+                print('Panel query unavailable; using cached heights or configured margins:',error,flush=True)
+            self.unavailable=True
+        else:
+            if self.unavailable:print('Panel height query recovered',flush=True)
+            self.panels=panels;self.unavailable=False
+        return self.panels
+
+def panel_margin(output,width,height,panels):
+    """Return matching bottom-panel height, or None for manual fallback."""
+    if panels is None:return None
+    pos=output.get('pos',{})
+    if 'x' not in pos or 'y' not in pos:return None
+    target=(pos['x'],pos['y'],width,height)
+    heights=[]
+    for panel in panels:
+        if not isinstance(panel,dict) or panel.get('location')!='bottom':continue
+        rect=panel.get('geometry',{})
+        if not isinstance(rect,dict):continue
+        try:
+            actual=tuple(float(rect[key]) for key in ('x','y','width','height'))
+            panel_height=float(panel['height'])
+        except (KeyError,TypeError,ValueError):continue
+        # A logical-pixel rounding tolerance covers fractional scaling.
+        if (math.isfinite(panel_height) and panel_height>0 and
+            all(math.isfinite(a) and abs(a-float(b))<=1 for a,b in zip(actual,target))):
+            heights.append(math.ceil(panel_height))
+    return max(heights) if heights else None
+
+def output_geometry(data, settings, panels=None):
     result={}
     for output in data.get('outputs',[]):
         if not output.get('connected') or not output.get('enabled'):continue
@@ -17,6 +65,12 @@ def output_geometry(data, settings):
         w,h=round(w/scale),round(h/scale)
         per_output=settings.get('outputs',{}).get(name,{})
         margin=max(0,int(per_output.get('bottom_margin',settings['bottom_margin'])))
+        if per_output.get('auto_panel_margin',settings.get('auto_panel_margin',False)):
+            measured=panel_margin(output,w,h,panels)
+            if measured is not None:
+                gap=max(0,int(per_output.get('panel_extra_gap',settings.get('panel_extra_gap',0))))
+                margin=measured+gap
+        margin=min(margin,max(0,h-1))
         height=max(1,min(int(settings['height']),h-margin))
         result[name]=(w,height,max(0,h-margin-height))
     return result
@@ -65,10 +119,10 @@ class Manager:
 
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--source',type=P,default=P.home()/'.local/share/alien-glava/source');p.add_argument('--config',type=P,default=P.home()/'.config/alien-glava');a=p.parse_args()
-    settings={'height':600,'amplify':600,'bottom_margin':80,'fps':60,'poll_seconds':2}
+    settings={'height':600,'amplify':600,'bottom_margin':80,'auto_panel_margin':True,'panel_extra_gap':0,'fps':60,'poll_seconds':2}
     if (a.config/'settings.json').exists():settings.update(json.loads((a.config/'settings.json').read_text()))
     runtime=P(os.environ.get('XDG_RUNTIME_DIR','/tmp'))/('alien-glava-'+str(os.getuid()));runtime.mkdir(mode=0o700,parents=True,exist_ok=True)
-    manager=Manager(a.source,a.config,runtime,settings);stopping=False
+    manager=Manager(a.source,a.config,runtime,settings);panel_tracker=PanelTracker();stopping=False
     def stop(signum,frame):
         nonlocal stopping
         stopping=True
@@ -77,7 +131,10 @@ def main():
         while not stopping:
             try:
                 result=subprocess.run(['kscreen-doctor','-j'],capture_output=True,text=True,timeout=5,check=True)
-                desired=output_geometry(json.loads(result.stdout),settings)
+                data=json.loads(result.stdout)
+                needs_panels=settings.get('auto_panel_margin',False) or any(o.get('auto_panel_margin',False) for o in settings.get('outputs',{}).values())
+                panels=panel_tracker.refresh() if needs_panels else None
+                desired=output_geometry(data,settings,panels)
             except (subprocess.SubprocessError,json.JSONDecodeError,ValueError) as error:
                 print('Display query unavailable; preserving current instances:',error,flush=True)
             else:manager.reconcile(desired)

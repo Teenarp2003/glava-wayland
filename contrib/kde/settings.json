@@ -3,5 +3,7 @@
   "amplify": 600,
   "bottom_margin": 80,
   "fps": 60,
-  "poll_seconds": 2
+  "poll_seconds": 2,
+  "auto_panel_margin": true,
+  "panel_extra_gap": 0
 }
