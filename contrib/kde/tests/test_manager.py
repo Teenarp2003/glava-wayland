@@ -12,6 +12,10 @@ class Tests(unittest.TestCase):
     def test_scaled_rotated_and_disconnected_outputs(self):
         data={'outputs':[{'name':'DP-1','enabled':True,'connected':True,'scale':1.5,'rotation':1,'size':{'width':3840,'height':2160}}, {'name':'HDMI-1','enabled':False,'connected':True,'size':{'width':1920,'height':1080}}, {'name':'DP-2','enabled':True,'connected':True,'rotation':2,'size':{'width':1920,'height':1080}}]}
         self.assertEqual(mod.output_geometry(data,{'height':600,'bottom_margin':80}),{'DP-1':(2560,600,760),'DP-2':(1080,600,1240)})
+    def test_per_output_panel_clearance(self):
+        data={'outputs':[{'name':'DP-1','enabled':True,'connected':True,'scale':1.5,'size':{'width':3840,'height':2160}}]}
+        settings={'height':600,'bottom_margin':80,'outputs':{'DP-1':{'bottom_margin':58}}}
+        self.assertEqual(mod.output_geometry(data,settings),{'DP-1':(2560,600,782)})
     def test_unplug_replug_and_resize_preserve_other_process(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(mod.subprocess,'Popen',Child):
             root=P(tmp);source=root/'source';(source/'shaders/glava').mkdir(parents=True);templates=P(__file__).resolve().parents[1]

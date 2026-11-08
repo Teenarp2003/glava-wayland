@@ -42,11 +42,11 @@ sudo apt-get install -y \
 **Compiling:**
 
 ```bash
-$ git clone https://github.com/Teenarp2003/glava
-$ cd glava
+$ git clone --recurse-submodules https://github.com/boredhero/glava-wayland
+$ cd glava-wayland
 $ meson setup build --prefix /usr -Denable_wayland=true -Ddisable_obs=true # Build with both X11 and Wayland support
 $ meson setup build --prefix /usr -Denable_wayland=true -Ddisable_glx=true -Ddisable_obs=true # Build with only the Wayland backend
-$ sudo ninja -C build
+$ ninja -C build
 $ sudo ninja -C build install
 $ sudo ldconfig
 ```
